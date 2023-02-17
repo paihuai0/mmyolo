@@ -18,7 +18,13 @@ from mmengine.structures import InstanceData
 from torch import Tensor
 
 from mmyolo.registry import MODELS, TASK_UTILS
-from ..utils import make_divisible
+# from ..utils import make_divisible
+
+def make_divisible(x: float,
+                   widen_factor: float = 1.0,
+                   divisor: int = 8) -> int:
+    """Make sure that x*widen_factor is divisible by divisor."""
+    return math.ceil(x * widen_factor / divisor) * divisor
 
 
 def get_prior_xy_info(index: int, num_base_priors: int,

@@ -4,6 +4,7 @@ import copy
 from abc import ABCMeta, abstractmethod
 from typing import Optional, Sequence, Tuple, Union
 
+
 import mmcv
 import numpy as np
 from mmcv.transforms import BaseTransform
@@ -1119,4 +1120,150 @@ class YOLOXMixUp(BaseMixImageTransform):
         repr_str += f'pad_val={self.pad_val}, '
         repr_str += f'max_refetch={self.max_refetch}, '
         repr_str += f'bbox_clip_border={self.bbox_clip_border})'
+        return repr_str
+
+import torch
+@TRANSFORMS.register_module()
+class RoadPaste(BaseMixImageTransform):
+    """RoadPaste augmentation.
+    """
+    def __init__(self,
+                 img_scale: Tuple[int, int] = (640, 640),
+                 center_ratio_range: Tuple[float,float] = (0.5, 1.5),
+                 min_bbox_size: int = 0,
+                 bbox_clip_border: bool = True,
+                 skip_filter: bool = True,
+                 pad_val: float = 114.0,
+                 prob: float = 1.0,
+
+                 pre_transform: Sequence[dict] = None,
+                 use_cached: bool = False,
+                 max_cached_images: int = 40,
+                 random_pop: bool = True,
+                 max_refetch: int = 15,
+
+                 roadname='date_captured'):
+        assert isinstance(img_scale, tuple)
+        assert 0 <= prob <= 1.0, 'The probability should be in range [0,1]. '\
+            f'got {prob}.'
+
+        super().__init__(
+            pre_transform=pre_transform,
+            prob=prob,
+            use_cached=use_cached,
+            max_cached_images=max_cached_images,
+            random_pop=random_pop,
+            max_refetch=max_refetch)
+
+        # log_img_scale(img_scale, skip_square=True)
+        self.img_scale = img_scale
+        self.center_ratio_range = center_ratio_range
+        self.min_bbox_size = min_bbox_size
+        self.bbox_clip_border = bbox_clip_border
+        self.skip_filter = skip_filter
+        self.pad_val = pad_val
+        self.prob = prob
+        self.roadname = roadname
+    def get_indexes(self, dataset):
+        """Call function to collect indexes.
+
+        Args:
+            dataset (:obj:`MultiImageMixDataset`): The dataset.
+
+        Returns:
+            list: indexes.
+        """
+
+        indexes = [random.randint(0, len(dataset)) for _ in range(3)]
+        return indexes
+
+    def compute_iou(self, box1, box2):
+        """Compute the intersection over union of two set of boxes, each box is [x1,y1,x2,y2].
+        """
+
+        N = box1.size(0)
+        M = box2.size(0)
+
+        lt = torch.max(
+            box1[:, :2].unsqueeze(1).expand(N, M, 2),
+            box2[:, :2].unsqueeze(0).expand(N, M, 2),
+        )
+
+        rb = torch.min(
+            box1[:, 2:].unsqueeze(1).expand(N, M, 2),
+            box2[:, 2:].unsqueeze(0).expand(N, M, 2),
+        )
+
+        wh = rb - lt
+        wh[wh < 0] = 0
+        inter = wh[:, :, 0] * wh[:, :, 1]
+
+        area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
+        area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+        area1 = area1.unsqueeze(1).expand_as(inter)
+        area2 = area2.unsqueeze(0).expand_as(inter)
+
+        iou = inter / (area1 + area2 - inter)
+        return iou
+
+    def mix_img_transform(self, results: dict) -> dict:
+        """RoadPaste transform function.
+
+        Args:
+            results (dict): Result dict.
+
+        Returns:
+            dict: Updated result dict.
+        """
+
+        assert 'mix_results' in results
+        # step1: roadside matching
+        match_id_list = []
+
+        for id in range(len(results['mix_results'])):
+            if results[self.roadname] == results['mix_results'][id][self.roadname]:
+                match_id_list.append(id)
+        if match_id_list == []:
+            return results
+        else:
+            # step2: find paste-allowed objects
+            if len(match_id_list) == 1:
+                match_id = match_id_list[0]
+            else:
+                match_id = match_id_list[random.randint(0, len(match_id_list)-1)]
+            dst_bboxes = results['gt_bboxes']
+            dst_ig_bboxes = results['gt_bboxes'].tensor[results['gt_ignore_flags']]
+            src_bboxes = results['mix_results'][match_id]['gt_bboxes']
+            # src_ig_bboxes = torch.from_numpy(results['mix_results'][match_id]['gt_bboxes_ignore'])
+
+            ious_gt = self.compute_iou(src_bboxes.tensor, dst_bboxes.tensor).numpy()
+            ious_gt_ignore =self.compute_iou(src_bboxes.tensor, dst_ig_bboxes).numpy()
+            ious_self = self.compute_iou(src_bboxes.tensor, src_bboxes.tensor).numpy()
+            # step3: select object and paste
+            for i in range(len(src_bboxes.tensor)):
+                if ious_self[i].sum() == 1 and ious_gt[i].sum() == 0 and ious_gt_ignore[i].sum() == 0:
+                    if random.randint(0, 1) == 0:
+                        paste_bbox = results['mix_results'][match_id]['gt_bboxes'][i]
+                        paste_labels = results['mix_results'][match_id]['gt_bboxes_labels'][i]
+                        # print(paste_labels)
+                        results['gt_bboxes'] = results['gt_bboxes'].cat((results['gt_bboxes'], paste_bbox), dim=0)
+                        results['gt_bboxes_labels'] = np.concatenate((results['gt_bboxes_labels'], np.array([paste_labels])))
+                        results['gt_ignore_flags'] = np.concatenate((results['gt_ignore_flags'], np.array([0])))
+
+                        copy_bbox = paste_bbox.tensor
+                        # results['mix_results'][match_id]['img'] = mmcv.imresize(results['mix_results'][match_id]['img'], (self.img_scale[0], self.img_scale[1]))
+                        results['img'][int(copy_bbox[:,1]):int(copy_bbox[:,3]), int(copy_bbox[:,0]):int(copy_bbox[:,2]), :] = \
+                            results['mix_results'][match_id]['img'][int(copy_bbox[:,1]):int(copy_bbox[:,3]),int(copy_bbox[:,0]):int(copy_bbox[:,2]),:]
+                        # results['gt_occs'] = np.concatenate((results['gt_occs'], np.array([0.0])))
+                        # results['gt_truncate'] = np.concatenate((results['gt_truncate'], np.array([00])))
+
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'img_scale={self.img_scale}, '
+        repr_str += f'center_ratio_range={self.center_ratio_range}, '
+        repr_str += f'pad_val={self.pad_val}, '
+        repr_str += f'min_bbox_size={self.min_bbox_size}, '
+        repr_str += f'skip_filter={self.skip_filter})'
         return repr_str

@@ -1070,3 +1070,4 @@ class PPYOLOERandomCrop(BaseTransform):
             valid, (cropped_box[:, :2] < cropped_box[:, 2:]).all(axis=1))
 
         return np.where(valid)[0]
+
